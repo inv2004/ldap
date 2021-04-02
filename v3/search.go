@@ -190,6 +190,7 @@ func readTag(f reflect.StructField) (string, bool) {
 // values are returned, the first value will be used to fill the field.
 //
 // Example:
+//
 //	type UserEntry struct {
 //		// Fields with the tag key `dn` are automatically filled with the
 //		// objects distinguishedName. This can be used multiple times.
@@ -217,7 +218,7 @@ func readTag(f reflect.StructField) (string, bool) {
 //
 //		// This won't work, as the field is not of type string. For this
 //		// to work, you'll have to temporarily store the result in string
-// 		// (or string array) and convert it to the desired type afterwards.
+//		// (or string array) and convert it to the desired type afterwards.
 //		UserAccountControl uint32 `ldap:"userPrincipalName"`
 //	}
 //	user := UserEntry{}
@@ -405,10 +406,11 @@ func NewSearchRequest(
 // SearchWithPaging accepts a search request and desired page size in order to execute LDAP queries to fulfill the
 // search request. All paged LDAP query responses will be buffered and the final result will be returned atomically.
 // The following four cases are possible given the arguments:
-//  - given SearchRequest missing a control of type ControlTypePaging: we will add one with the desired paging size
-//  - given SearchRequest contains a control of type ControlTypePaging that isn't actually a ControlPaging: fail without issuing any queries
-//  - given SearchRequest contains a control of type ControlTypePaging with pagingSize equal to the size requested: no change to the search request
-//  - given SearchRequest contains a control of type ControlTypePaging with pagingSize not equal to the size requested: fail without issuing any queries
+//   - given SearchRequest missing a control of type ControlTypePaging: we will add one with the desired paging size
+//   - given SearchRequest contains a control of type ControlTypePaging that isn't actually a ControlPaging: fail without issuing any queries
+//   - given SearchRequest contains a control of type ControlTypePaging with pagingSize equal to the size requested: no change to the search request
+//   - given SearchRequest contains a control of type ControlTypePaging with pagingSize not equal to the size requested: fail without issuing any queries
+//
 // A requested pagingSize of 0 is interpreted as no limit by LDAP servers.
 func (l *Conn) SearchWithPaging(searchRequest *SearchRequest, pagingSize uint32) (*SearchResult, error) {
 	var pagingControl *ControlPaging
@@ -519,26 +521,91 @@ func (l *Conn) Search(searchRequest *SearchRequest) (*SearchResult, error) {
 	}
 }
 
-// unpackAttributes will extract all given LDAP attributes and it's values
-// from the ber.Packet
-func unpackAttributes(children []*ber.Packet) []*EntryAttribute {
-	entries := make([]*EntryAttribute, len(children))
-	for i, child := range children {
-		length := len(child.Children[1].Children)
-		entry := &EntryAttribute{
-			Name: child.Children[0].Value.(string),
-			// pre-allocate the slice since we can determine
-			// the number of attributes at this point
-			Values:     make([]string, length),
-			ByteValues: make([][]byte, length),
-		}
+// SearchWithChannel performs a search request and returns all search results via the given
+// channel as soon as they are received. This means you get all results until an error
+// happens (or the search successfully finished), e.g. for size / time limited requests all
+// are recieved via the channel until the limit is reached.
+func (l *Conn) SearchWithChannel(searchRequest *SearchRequest, ch chan *SearchResult) error {
+	if ch == nil {
+		return NewError(ErrorUsage, errors.New("ldap: SearchWithChannel got nil channel"))
+	}
+	defer close(ch)
 
-		for i, value := range child.Children[1].Children {
-			entry.ByteValues[i] = value.ByteValue
-			entry.Values[i] = value.Value.(string)
-		}
-		entries[i] = entry
+	packet := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Request")
+	packet.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, l.nextMessageID(), "MessageID"))
+	// encode search request
+	err := searchRequest.appendTo(packet)
+	if err != nil {
+		return err
 	}
 
-	return entries
+	l.Debug.PrintPacket(packet)
+
+	msgCtx, err := l.sendMessage(packet)
+	if err != nil {
+		return err
+	}
+	defer l.finishMessage(msgCtx)
+
+	foundSearchResultDone := false
+	for !foundSearchResultDone {
+		l.Debug.Printf("%d: waiting for response", msgCtx.id)
+		packetResponse, ok := <-msgCtx.responses
+		if !ok {
+			return NewError(ErrorNetwork, errors.New("ldap: response channel closed"))
+		}
+		packet, err = packetResponse.ReadPacket()
+		l.Debug.Printf("%d: got response %p", msgCtx.id, packet)
+		if err != nil {
+			return err
+		}
+
+		if l.Debug {
+			if err := addLDAPDescriptions(packet); err != nil {
+				return err
+			}
+			ber.PrintPacket(packet)
+		}
+
+		switch packet.Children[1].Tag {
+		case ApplicationSearchResultEntry:
+			entry := new(Entry)
+			entry.DN = packet.Children[1].Children[0].Value.(string)
+			for _, child := range packet.Children[1].Children[1].Children {
+				attr := new(EntryAttribute)
+				attr.Name = child.Children[0].Value.(string)
+				for _, value := range child.Children[1].Children {
+					attr.Values = append(attr.Values, value.Value.(string))
+					attr.ByteValues = append(attr.ByteValues, value.ByteValue)
+				}
+				entry.Attributes = append(entry.Attributes, attr)
+			}
+			ch <- &SearchResult{Entries: []*Entry{entry}}
+
+		case ApplicationSearchResultDone:
+			if err := GetLDAPError(packet); err != nil {
+				return err
+			}
+			if len(packet.Children) == 3 {
+				result := &SearchResult{}
+				for _, child := range packet.Children[2].Children {
+					decodedChild, err := DecodeControl(child)
+					if err != nil {
+						return fmt.Errorf("failed to decode child control: %s", err)
+					}
+					result.Controls = append(result.Controls, decodedChild)
+				}
+				ch <- result
+			}
+			foundSearchResultDone = true
+
+		case ApplicationSearchResultReference:
+			ref := packet.Children[1].Children[0].Value.(string)
+			ch <- &SearchResult{Referrals: []string{ref}}
+		}
+	}
+
+	l.Debug.Printf("%d: returning", msgCtx.id)
+	return nil
+
 }
