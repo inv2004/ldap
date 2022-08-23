@@ -49,7 +49,7 @@ func TestUnresponsiveConnection(t *testing.T) {
 	if !ok {
 		t.Fatalf("no PacketResponse in response channel")
 	}
-	packet, err = packetResponse.ReadPacket()
+	_, err = packetResponse.ReadPacket()
 	if err == nil {
 		t.Fatalf("expected timeout error")
 	}
@@ -102,6 +102,15 @@ func TestFinishMessage(t *testing.T) {
 	// We cannot run Close() in a defer because t.FailNow() will run it and
 	// it will block if the processMessage Loop is in a deadlock.
 	conn.Close()
+}
+
+// See: https://github.com/go-ldap/ldap/issues/332
+func TestNilConnection(t *testing.T) {
+	var conn *Conn
+	_, err := conn.Search(&SearchRequest{})
+	if err != ErrNilConnection {
+		t.Fatalf("expected error to be ErrNilConnection, got %v", err)
+	}
 }
 
 func testSendRequest(t *testing.T, ptc *packetTranslatorConn, conn *Conn) (msgCtx *messageContext) {

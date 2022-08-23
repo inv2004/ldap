@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/url"
 	"sync"
@@ -88,6 +87,7 @@ const (
 type Conn struct {
 	// requestTimeout is loaded atomically
 	// so we need to ensure 64-bit alignment on 32-bit platforms.
+	// https://github.com/go-ldap/ldap/pull/199
 	requestTimeout      int64
 	conn                net.Conn
 	isTLS               bool
@@ -127,6 +127,15 @@ func DialWithDialer(d *net.Dialer) DialOpt {
 func DialWithTLSConfig(tc *tls.Config) DialOpt {
 	return func(dc *DialContext) {
 		dc.tc = tc
+	}
+}
+
+// DialWithTLSDialer is a wrapper for DialWithTLSConfig with the option to
+// specify a net.Dialer to for example define a timeout or a custom resolver.
+func DialWithTLSDialer(tlsConfig *tls.Config, dialer *net.Dialer) DialOpt {
+	return func(dc *DialContext) {
+		dc.tc = tlsConfig
+		dc.d = dialer
 	}
 }
 
@@ -263,7 +272,7 @@ func (l *Conn) Close() {
 
 		l.Debug.Printf("Closing network connection")
 		if err := l.conn.Close(); err != nil {
-			log.Println(err)
+			logger.Println(err)
 		}
 
 		l.wgClose.Done()
@@ -273,9 +282,7 @@ func (l *Conn) Close() {
 
 // SetTimeout sets the time after a request is sent that a MessageTimeout triggers
 func (l *Conn) SetTimeout(timeout time.Duration) {
-	if timeout > 0 {
-		atomic.StoreInt64(&l.requestTimeout, int64(timeout))
-	}
+	atomic.StoreInt64(&l.requestTimeout, int64(timeout))
 }
 
 // Returns the next available messageID
@@ -434,7 +441,7 @@ func (l *Conn) sendProcessMessage(message *messagePacket) bool {
 func (l *Conn) processMessages() {
 	defer func() {
 		if err := recover(); err != nil {
-			log.Printf("ldap: recovered panic in processMessages: %v", err)
+			logger.Printf("ldap: recovered panic in processMessages: %v", err)
 		}
 		for messageID, msgCtx := range l.messageContexts {
 			// If we are closing due to an error, inform anyone who
@@ -478,20 +485,26 @@ func (l *Conn) processMessages() {
 				l.messageContexts[message.MessageID] = message.Context
 
 				// Add timeout if defined
-				requestTimeout := time.Duration(atomic.LoadInt64(&l.requestTimeout))
-				if requestTimeout > 0 {
+				if l.requestTimeout > 0 {
 					go func() {
+						timer := time.NewTimer(time.Duration(l.requestTimeout))
 						defer func() {
 							if err := recover(); err != nil {
-								log.Printf("ldap: recovered panic in RequestTimeout: %v", err)
+								logger.Printf("ldap: recovered panic in RequestTimeout: %v", err)
 							}
+
+							timer.Stop()
 						}()
-						time.Sleep(requestTimeout)
-						timeoutMessage := &messagePacket{
-							Op:        MessageTimeout,
-							MessageID: message.MessageID,
+
+						select {
+						case <-timer.C:
+							timeoutMessage := &messagePacket{
+								Op:        MessageTimeout,
+								MessageID: message.MessageID,
+							}
+							l.sendProcessMessage(timeoutMessage)
+						case <-message.Context.done:
 						}
-						l.sendProcessMessage(timeoutMessage)
 					}()
 				}
 			case MessageResponse:
@@ -499,7 +512,7 @@ func (l *Conn) processMessages() {
 				if msgCtx, ok := l.messageContexts[message.MessageID]; ok {
 					msgCtx.sendResponse(&PacketResponse{message.Packet, nil})
 				} else {
-					log.Printf("Received unexpected message %d, %v", message.MessageID, l.IsClosing())
+					logger.Printf("Received unexpected message %d, %v", message.MessageID, l.IsClosing())
 					l.Debug.PrintPacket(message.Packet)
 				}
 			case MessageTimeout:
@@ -526,7 +539,7 @@ func (l *Conn) reader() {
 	cleanstop := false
 	defer func() {
 		if err := recover(); err != nil {
-			log.Printf("ldap: recovered panic in reader: %v", err)
+			logger.Printf("ldap: recovered panic in reader: %v", err)
 		}
 		if !cleanstop {
 			l.Close()

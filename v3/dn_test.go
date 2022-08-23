@@ -45,6 +45,17 @@ func TestSuccessfulDNParsing(t *testing.T) {
 			{[]*AttributeTypeAndValue{
 				{"  A  ", "  1  "},
 				{"  B  ", "  2  "}}}}},
+
+		`cn=john.doe;dc=example,dc=net`: {[]*RelativeDN{
+			{[]*AttributeTypeAndValue{{"cn", "john.doe"}}},
+			{[]*AttributeTypeAndValue{{"dc", "example"}}},
+			{[]*AttributeTypeAndValue{{"dc", "net"}}}}},
+
+		// Escaped `;` should not be treated as RDN
+		`cn=john.doe\;weird name,dc=example,dc=net`: {[]*RelativeDN{
+			{[]*AttributeTypeAndValue{{"cn", "john.doe;weird name"}}},
+			{[]*AttributeTypeAndValue{{"dc", "example"}}},
+			{[]*AttributeTypeAndValue{{"dc", "net"}}}}},
 	}
 
 	for test, answer := range testcases {
@@ -137,8 +148,8 @@ func TestDNEqual(t *testing.T) {
 		},
 		// Difference in leading/trailing chars is ignored
 		{
-			"cn=John Doe, ou=People, dc=sun.com",
-			"cn=John Doe,ou=People,dc=sun.com",
+			"cn=\\ John\\20Doe, ou=People, dc=sun.com",
+			"cn= \\ John Doe,ou=People,dc=sun.com",
 			true,
 		},
 		// Difference in values is significant
@@ -147,6 +158,8 @@ func TestDNEqual(t *testing.T) {
 			"cn=John  Doe, ou=People, dc=sun.com",
 			false,
 		},
+		// Test parsing of `;` for separating RDNs
+		{"cn=john;dc=example,dc=com", "cn=john,dc=example,dc=com", true}, // missing values matter
 	}
 
 	for i, tc := range testcases {
@@ -161,10 +174,59 @@ func TestDNEqual(t *testing.T) {
 			continue
 		}
 		if expected, actual := tc.Equal, a.Equal(b); expected != actual {
-			t.Errorf("%d: when comparing '%s' and '%s' expected %v, got %v", i, tc.A, tc.B, expected, actual)
+			t.Errorf("%d: when comparing %q and %q expected %v, got %v", i, a, b, expected, actual)
 			continue
 		}
 		if expected, actual := tc.Equal, b.Equal(a); expected != actual {
+			t.Errorf("%d: when comparing %q and %q expected %v, got %v", i, a, b, expected, actual)
+			continue
+		}
+
+		if expected, actual := a.Equal(b), a.String() == b.String(); expected != actual {
+			t.Errorf("%d: when asserting string comparison of %q and %q expected equal %v, got %v", i, a, b, expected, actual)
+			continue
+		}
+	}
+}
+
+func TestDNEqualFold(t *testing.T) {
+	testcases := []struct {
+		A     string
+		B     string
+		Equal bool
+	}{
+		// Match on case insensitive
+		{"o=A", "o=a", true},
+		{"o=A,o=b", "o=a,o=B", true},
+		{"o=a+o=B", "o=A+o=b", true},
+		{
+			"cn=users,ou=example,dc=com",
+			"cn=Users,ou=example,dc=com",
+			true,
+		},
+
+		// Match on case insensitive and case mismatch in type
+		{"o=A", "O=a", true},
+		{"o=A,o=b", "o=a,O=B", true},
+		{"o=a+o=B", "o=A+O=b", true},
+	}
+
+	for i, tc := range testcases {
+		a, err := ParseDN(tc.A)
+		if err != nil {
+			t.Errorf("%d: %v", i, err)
+			continue
+		}
+		b, err := ParseDN(tc.B)
+		if err != nil {
+			t.Errorf("%d: %v", i, err)
+			continue
+		}
+		if expected, actual := tc.Equal, a.EqualFold(b); expected != actual {
+			t.Errorf("%d: when comparing '%s' and '%s' expected %v, got %v", i, tc.A, tc.B, expected, actual)
+			continue
+		}
+		if expected, actual := tc.Equal, b.EqualFold(a); expected != actual {
 			t.Errorf("%d: when comparing '%s' and '%s' expected %v, got %v", i, tc.A, tc.B, expected, actual)
 			continue
 		}
